@@ -32,7 +32,7 @@ export interface ChannelSession {
 export interface TerminalInstance {
   id: string;
   channelId: string;
-  pty: any; // node-pty IPty
+  activeProcess?: any;
   mcpPort: number;
   lastActivity: Date;
 }

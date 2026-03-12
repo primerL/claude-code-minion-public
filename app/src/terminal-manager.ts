@@ -1,4 +1,4 @@
-import * as pty from 'node-pty';
+import { spawn } from 'child_process';
 import { v4 as uuidv4 } from 'uuid';
 import { TerminalInstance } from './types.js';
 import * as path from 'path';
@@ -25,6 +25,9 @@ export class TerminalManager {
   private outputBuffers: Map<string, string[]> = new Map();
   private workingDirectory: string;
   private appDirectory: string;
+  private shellPath: string;
+  private claudePath: string;
+  private nodePath: string;
   private mcpConfigs: Map<string, string> = new Map(); // channelId -> mcpConfigPath
   private sessionIds: Map<string, string> = new Map(); // channelId -> claude session UUID
   private sessionIdsFilePath: string; // Path to persist session IDs
@@ -43,10 +46,59 @@ export class TerminalManager {
   ) {
     this.workingDirectory = workingDirectory;
     this.appDirectory = appDirectory;
+    this.shellPath = this.resolveShellPath();
+    this.claudePath = this.resolveExecutablePath(
+      'claude',
+      [
+        path.join(process.env.HOME || '', '.local', 'bin', 'claude'),
+        '/usr/local/bin/claude',
+        '/opt/homebrew/bin/claude',
+      ]
+    );
+    this.nodePath = process.execPath;
     this.sessionIdsFilePath = path.join(workingDirectory, '.minion-claude-sessions.json');
     this.onQueueProcessCallback = onQueueProcess;
     this.onAgentTurnCompleteCallback = onAgentTurnComplete;
+    console.log(`[TerminalManager] shell=${this.shellPath} claude=${this.claudePath} node=${this.nodePath}`);
     this.loadSessionIds();
+  }
+
+  private isExecutable(filePath: string): boolean {
+    if (!filePath) {
+      return false;
+    }
+
+    try {
+      fs.accessSync(filePath, fs.constants.X_OK);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private resolveExecutablePath(command: string, fallbacks: string[] = []): string {
+    const pathEntries = (process.env.PATH || '').split(path.delimiter).filter(Boolean);
+
+    for (const candidate of [...fallbacks, ...pathEntries.map(entry => path.join(entry, command))]) {
+      if (this.isExecutable(candidate)) {
+        return candidate;
+      }
+    }
+
+    return command;
+  }
+
+  private resolveShellPath(): string {
+    if (process.platform === 'win32') {
+      return 'powershell.exe';
+    }
+
+    const preferredShell = process.env.SHELL;
+    if (preferredShell && this.isExecutable(preferredShell)) {
+      return preferredShell;
+    }
+
+    return this.resolveExecutablePath('bash', ['/bin/bash', '/bin/zsh']);
   }
 
   // Load persisted session IDs from disk
@@ -86,7 +138,7 @@ export class TerminalManager {
     const mcpConfig = {
       mcpServers: {
         'slack-messenger': {
-          command: 'node',
+          command: this.nodePath,
           args: [path.join(this.appDirectory, 'dist', 'mcp-server.js')],
           env: {
             MCP_PORT: mcpPort.toString(),
@@ -102,35 +154,10 @@ export class TerminalManager {
     this.mcpConfigs.set(channelId, mcpConfigPath);
     // Session ID will be captured from first command's JSON output
 
-    // Spawn a shell for running claude commands
-    const shell = process.platform === 'win32' ? 'powershell.exe' : 'bash';
-
-    // Build environment with optional OAuth token override
-    const spawnEnv: Record<string, string | undefined> = {
-      ...process.env,
-      TERM: 'xterm-256color',
-      MCP_PORT: mcpPort.toString(),
-      CHANNEL_ID: channelId,
-    };
-
-    // If a specific OAuth token is provided, use it instead of the inherited one
-    if (oauthToken) {
-      spawnEnv.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
-      console.log(`[Terminal ${channelId}] Using specific OAuth token (${oauthToken.substring(0, 15)}...)`);
-    }
-
-    const ptyProcess = pty.spawn(shell, [], {
-      name: 'xterm-256color',
-      cols: 120,
-      rows: 40,
-      cwd: this.workingDirectory,
-      env: spawnEnv,
-    });
-
     const terminal: TerminalInstance = {
       id,
       channelId,
-      pty: ptyProcess,
+      activeProcess: undefined,
       mcpPort,
       lastActivity: new Date(),
     };
@@ -138,102 +165,150 @@ export class TerminalManager {
     this.terminals.set(id, terminal);
     this.outputBuffers.set(id, []);
 
-    // Collect output and log for debugging
-    ptyProcess.onData((data: string) => {
-      const buffer = this.outputBuffers.get(id);
-      if (buffer) {
-        buffer.push(data);
-        // Keep only last 1000 lines
-        if (buffer.length > 1000) {
-          buffer.shift();
-        }
-      }
-      terminal.lastActivity = new Date();
-      // Debug: log terminal output
-      const cleanData = stripAnsi ? stripAnsi(data) : data;
-      if (cleanData.trim()) {
-        console.log(`[Terminal ${channelId}] ${cleanData}`);
-      }
-
-      // Extract session_id from JSON output if we're waiting for it
-      if (this.awaitingSessionId.has(channelId)) {
-        // Look for session_id in JSON output: "session_id": "uuid"
-        const sessionMatch = cleanData.match(/"session_id"\s*:\s*"([^"]+)"/);
-        if (sessionMatch) {
-          const extractedSessionId = sessionMatch[1];
-          this.sessionIds.set(channelId, extractedSessionId);
-          this.awaitingSessionId.delete(channelId);
-          this.saveSessionIds(); // Persist to disk for restart recovery
-          console.log(`[Session] Captured session ID for channel ${channelId}: ${extractedSessionId.substring(0, 8)}...`);
-        }
-      }
-
-      // Extract usage stats from JSON result
-      // Look for {"type":"result"...} and parse it
-      const resultStart = cleanData.indexOf('{"type":"result"');
-      if (resultStart !== -1) {
-        // Find matching closing brace
-        let braceCount = 0;
-        let endIdx = -1;
-        for (let i = resultStart; i < cleanData.length; i++) {
-          if (cleanData[i] === '{') braceCount++;
-          if (cleanData[i] === '}') braceCount--;
-          if (braceCount === 0) {
-            endIdx = i + 1;
-            break;
-          }
-        }
-        if (endIdx !== -1) {
-          try {
-            const resultJson = JSON.parse(cleanData.substring(resultStart, endIdx));
-            if (resultJson.usage) {
-              this.latestUsageStats.set(channelId, resultJson.usage);
-              console.log(`[Usage] Captured usage stats for channel ${channelId}`);
-            }
-          } catch (e) {
-            // JSON not complete yet, ignore
-          }
-        }
-      }
-
-      // Detect when Claude command finishes using sentinel marker
-      // The marker must appear at the START of a line (after newline) to distinguish
-      // from the shell echoing the command itself
-      if (this.busyChannels.has(channelId)) {
-        // Check if marker appears at start of line (real output) vs embedded in command echo
-        const lines = cleanData.split('\n');
-        for (const line of lines) {
-          const trimmedLine = line.trim();
-          if (trimmedLine === '___CLAUDE_DONE___') {
-            // Command finished
-            this.busyChannels.delete(channelId);
-            console.log(`[Terminal ${channelId}] Claude command finished`);
-
-            // Notify that agent turn is complete
-            if (this.onAgentTurnCompleteCallback) {
-              this.onAgentTurnCompleteCallback(channelId).catch(err => {
-                console.error('[AgentTurnComplete] Error in callback:', err);
-              });
-            }
-
-            // Process next queued message immediately
-            this.processQueue(channelId);
-            break;
-          }
-        }
-      }
-    });
-
-    ptyProcess.onExit(({ exitCode }) => {
-      console.log(`Terminal ${id} exited with code ${exitCode}`);
-      this.terminals.delete(id);
-      this.outputBuffers.delete(id);
-    });
-
-    // Wait a moment for shell to initialize
-    await new Promise(resolve => setTimeout(resolve, 500));
-
     return terminal;
+  }
+
+  private buildCommandEnv(channelId: string, mcpPort: number, oauthToken?: string): NodeJS.ProcessEnv {
+    const commandEnv: NodeJS.ProcessEnv = {
+      ...process.env,
+      TERM: 'xterm-256color',
+      MCP_PORT: mcpPort.toString(),
+      CHANNEL_ID: channelId,
+      PATH: Array.from(new Set([
+        path.dirname(this.claudePath),
+        path.dirname(this.nodePath),
+        ...(process.env.PATH || '').split(path.delimiter).filter(Boolean),
+      ])).join(path.delimiter),
+    };
+
+    if (oauthToken) {
+      commandEnv.CLAUDE_CODE_OAUTH_TOKEN = oauthToken;
+      console.log(`[Terminal ${channelId}] Using specific OAuth token (${oauthToken.substring(0, 15)}...)`);
+    }
+
+    return commandEnv;
+  }
+
+  private appendOutput(terminalId: string, channelId: string, data: string): void {
+    const buffer = this.outputBuffers.get(terminalId);
+    if (buffer) {
+      buffer.push(data);
+      if (buffer.length > 1000) {
+        buffer.shift();
+      }
+    }
+
+    const terminal = this.terminals.get(terminalId);
+    if (terminal) {
+      terminal.lastActivity = new Date();
+    }
+
+    const cleanData = stripAnsi ? stripAnsi(data) : data;
+    if (cleanData.trim()) {
+      console.log(`[Terminal ${channelId}] ${cleanData}`);
+    }
+
+    if (this.awaitingSessionId.has(channelId)) {
+      const sessionMatch = cleanData.match(/"session_id"\s*:\s*"([^"]+)"/);
+      if (sessionMatch) {
+        const extractedSessionId = sessionMatch[1];
+        this.sessionIds.set(channelId, extractedSessionId);
+        this.awaitingSessionId.delete(channelId);
+        this.saveSessionIds();
+        console.log(`[Session] Captured session ID for channel ${channelId}: ${extractedSessionId.substring(0, 8)}...`);
+      }
+    }
+
+    const resultStart = cleanData.indexOf('{"type":"result"');
+    if (resultStart !== -1) {
+      let braceCount = 0;
+      let endIdx = -1;
+      for (let i = resultStart; i < cleanData.length; i++) {
+        if (cleanData[i] === '{') braceCount++;
+        if (cleanData[i] === '}') braceCount--;
+        if (braceCount === 0) {
+          endIdx = i + 1;
+          break;
+        }
+      }
+      if (endIdx !== -1) {
+        try {
+          const resultJson = JSON.parse(cleanData.substring(resultStart, endIdx));
+          if (resultJson.usage) {
+            this.latestUsageStats.set(channelId, resultJson.usage);
+            console.log(`[Usage] Captured usage stats for channel ${channelId}`);
+          }
+        } catch {
+          // Ignore partial JSON chunks.
+        }
+      }
+    }
+  }
+
+  private handleProcessExit(channelId: string, terminalId: string, exitCode: number | null, signal: NodeJS.Signals | null): void {
+    const terminal = this.terminals.get(terminalId);
+    if (terminal) {
+      terminal.activeProcess = undefined;
+      terminal.lastActivity = new Date();
+    }
+
+    if (this.busyChannels.has(channelId)) {
+      this.busyChannels.delete(channelId);
+      console.log(`[Terminal ${channelId}] Claude command finished (code=${exitCode ?? 'null'}, signal=${signal ?? 'none'})`);
+
+      if (this.onAgentTurnCompleteCallback) {
+        this.onAgentTurnCompleteCallback(channelId).catch(err => {
+          console.error('[AgentTurnComplete] Error in callback:', err);
+        });
+      }
+
+      this.processQueue(channelId);
+    }
+  }
+
+  private spawnClaudeProcess(
+    terminal: TerminalInstance,
+    args: string[],
+    oauthToken?: string,
+    onStdout?: (data: string) => void,
+    onStderr?: (data: string) => void,
+    onExit?: (exitCode: number | null, signal: NodeJS.Signals | null) => void,
+  ) {
+    const commandEnv = this.buildCommandEnv(terminal.channelId, terminal.mcpPort, oauthToken);
+    const child = spawn(this.claudePath, args, {
+      cwd: this.workingDirectory,
+      env: commandEnv,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    terminal.activeProcess = child;
+    terminal.lastActivity = new Date();
+
+    child.stdout.on('data', (chunk: Buffer | string) => {
+      const data = chunk.toString();
+      this.appendOutput(terminal.id, terminal.channelId, data);
+      onStdout?.(data);
+    });
+
+    child.stderr.on('data', (chunk: Buffer | string) => {
+      const data = chunk.toString();
+      this.appendOutput(terminal.id, terminal.channelId, data);
+      onStderr?.(data);
+    });
+
+    child.on('error', (error) => {
+      console.error(`[Terminal ${terminal.channelId}] Failed to spawn Claude command:`, error);
+      this.appendOutput(terminal.id, terminal.channelId, `Failed to spawn Claude command: ${error.message}\n`);
+      this.handleProcessExit(terminal.channelId, terminal.id, null, null);
+      onExit?.(null, null);
+    });
+
+    child.on('close', (exitCode, signal) => {
+      this.handleProcessExit(terminal.channelId, terminal.id, exitCode, signal);
+      onExit?.(exitCode, signal);
+    });
+
+    return child;
   }
 
   // Queue a message to be sent to Claude (handles busy state)
@@ -277,15 +352,6 @@ export class TerminalManager {
       return false;
     }
 
-    // Escape the input for shell (use double quotes and escape properly)
-    const escapedInput = input
-      .replace(/\\/g, '\\\\')
-      .replace(/"/g, '\\"')
-      .replace(/\$/g, '\\$')
-      .replace(/`/g, '\\`')
-      .replace(/\n/g, ' ')  // Replace newlines with spaces to avoid shell continuation prompts
-      .replace(/\r/g, '');  // Remove carriage returns
-
     // Mark channel as busy
     this.busyChannels.add(channelId);
 
@@ -295,26 +361,19 @@ export class TerminalManager {
     // Get model from environment variable, default to sonnet-4.5
     const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-5-20250929';
 
-    // Build token prefix if provided (for dynamic token switching)
-    // This allows changing tokens without respawning the terminal
-    const tokenPrefix = oauthToken ? `CLAUDE_CODE_OAUTH_TOKEN="${oauthToken}" ` : '';
-
-    let claudeCmd: string;
+    const args = ['-p', input.replace(/\r/g, ''), '--model', model, '--output-format', 'json'];
     if (existingSessionId) {
-      // Resume existing session
-      claudeCmd = `${tokenPrefix}claude -p "${escapedInput}" --model ${model} --output-format json --resume "${existingSessionId}" --mcp-config "${mcpConfigPath}" ; echo "___CLAUDE_DONE___"`;
+      args.push('--resume', existingSessionId);
       const tokenLog = oauthToken ? ` (token: ${oauthToken.substring(0, 15)}...)` : '';
-      console.log(`[Sending to Claude] claude -p "..." --model ${model} --output-format json --resume "${existingSessionId.substring(0, 8)}..."${tokenLog}`);
+      console.log(`[Sending to Claude] ${this.claudePath} -p "..." --model ${model} --output-format json --resume "${existingSessionId.substring(0, 8)}..."${tokenLog}`);
     } else {
-      // Start new conversation
-      claudeCmd = `${tokenPrefix}claude -p "${escapedInput}" --model ${model} --output-format json --mcp-config "${mcpConfigPath}" ; echo "___CLAUDE_DONE___"`;
       this.awaitingSessionId.add(channelId);
       const tokenLog = oauthToken ? ` (token: ${oauthToken.substring(0, 15)}...)` : '';
-      console.log(`[Sending to Claude] claude -p "..." --model ${model} --output-format json (new conversation)${tokenLog}`);
+      console.log(`[Sending to Claude] ${this.claudePath} -p "..." --model ${model} --output-format json (new conversation)${tokenLog}`);
     }
+    args.push('--mcp-config', mcpConfigPath);
 
-    terminal.pty.write(claudeCmd + '\r');
-    terminal.lastActivity = new Date();
+    this.spawnClaudeProcess(terminal, args, oauthToken);
     return true;
   }
 
@@ -358,14 +417,7 @@ export class TerminalManager {
   }
 
   sendRawInput(terminalId: string, input: string): boolean {
-    const terminal = this.terminals.get(terminalId);
-    if (!terminal) {
-      console.error(`Terminal ${terminalId} not found`);
-      return false;
-    }
-
-    terminal.pty.write(input);
-    terminal.lastActivity = new Date();
+    console.warn(`sendRawInput is not supported without PTY. Ignored input for terminal ${terminalId}: ${input.slice(0, 40)}`);
     return true;
   }
 
@@ -377,8 +429,12 @@ export class TerminalManager {
       return false;
     }
 
-    // Send Ctrl+C
-    terminal.pty.write('\x03');
+    if (!terminal.activeProcess) {
+      console.error(`Terminal ${terminalId} has no active Claude process to interrupt`);
+      return false;
+    }
+
+    terminal.activeProcess.kill('SIGINT');
     terminal.lastActivity = new Date();
     return true;
   }
@@ -413,7 +469,10 @@ export class TerminalManager {
       return false;
     }
 
-    terminal.pty.kill();
+    if (terminal.activeProcess) {
+      terminal.activeProcess.kill('SIGTERM');
+      terminal.activeProcess = undefined;
+    }
     this.terminals.delete(terminalId);
     this.outputBuffers.delete(terminalId);
     return true;
@@ -437,7 +496,8 @@ export class TerminalManager {
       return false;
     }
 
-    terminal.pty.resize(cols, rows);
+    void cols;
+    void rows;
     return true;
   }
 
@@ -490,27 +550,15 @@ export class TerminalManager {
       throw new Error(`MCP config not found for channel ${channelId}`);
     }
 
-    // Escape the input for shell
-    const escapedInput = input
-      .replace(/\\/g, '\\\\')
-      .replace(/"/g, '\\"')
-      .replace(/\$/g, '\\$')
-      .replace(/`/g, '\\`')
-      .replace(/\n/g, ' ')
-      .replace(/\r/g, '');
-
     const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-5-20250929';
     const existingSessionId = this.sessionIds.get(channelId);
-
-    // Build command with --output-format json
-    let claudeCmd: string;
+    const args = ['-p', input.replace(/\r/g, ''), '--model', model, '--output-format', 'json'];
     if (existingSessionId) {
-      claudeCmd = `claude -p "${escapedInput}" --model ${model} --output-format json --resume "${existingSessionId}" --mcp-config "${mcpConfigPath}" ; echo "___CLAUDE_DONE___"`;
-    } else {
-      claudeCmd = `claude -p "${escapedInput}" --model ${model} --output-format json --mcp-config "${mcpConfigPath}" ; echo "___CLAUDE_DONE___"`;
+      args.push('--resume', existingSessionId);
     }
+    args.push('--mcp-config', mcpConfigPath);
 
-    console.log(`[/context] Sending: claude -p "..." --model ${model} --output-format json${existingSessionId ? ` --resume "${existingSessionId.substring(0, 8)}..."` : ''}`);
+    console.log(`[/context] Sending: ${this.claudePath} -p "..." --model ${model} --output-format json${existingSessionId ? ` --resume "${existingSessionId.substring(0, 8)}..."` : ''}`);
 
     // Mark channel as busy
     this.busyChannels.add(channelId);
@@ -518,8 +566,6 @@ export class TerminalManager {
     return new Promise((resolve, reject) => {
       let output = '';
       let resolved = false;
-      let sawDoneMarker = false;
-
       const timeout = setTimeout(() => {
         if (!resolved) {
           resolved = true;
@@ -560,43 +606,39 @@ export class TerminalManager {
       const dataHandler = (data: string) => {
         output += data;
 
-        // Check for completion marker
-        if (output.includes('___CLAUDE_DONE___') && !sawDoneMarker) {
-          sawDoneMarker = true;
-          // Wait a bit for all output to arrive, then parse
-          setTimeout(() => {
-            if (!resolved) {
-              const result = tryParseResult();
-              if (result) {
-                resolved = true;
-                clearTimeout(timeout);
-                this.busyChannels.delete(channelId);
-                resolve(result);
-              } else {
-                // Keep waiting for more data, will be handled by subsequent data events
-              }
-            }
-          }, 500);
-        }
-
-        // Also try to parse on each data event after done marker (in case JSON comes in chunks)
-        if (sawDoneMarker && !resolved) {
-          const result = tryParseResult();
-          if (result) {
-            resolved = true;
-            clearTimeout(timeout);
-            this.busyChannels.delete(channelId);
-            resolve(result);
-          }
+        const result = tryParseResult();
+        if (result && !resolved) {
+          resolved = true;
+          clearTimeout(timeout);
+          this.busyChannels.delete(channelId);
+          resolve(result);
         }
       };
 
-      // Listen for data
-      terminal.pty.onData(dataHandler);
+      this.spawnClaudeProcess(
+        terminal,
+        args,
+        undefined,
+        dataHandler,
+        dataHandler,
+        () => {
+          if (!resolved) {
+            const result = tryParseResult();
+            if (result) {
+              resolved = true;
+              clearTimeout(timeout);
+              this.busyChannels.delete(channelId);
+              resolve(result);
+              return;
+            }
 
-      // Send the command
-      terminal.pty.write(claudeCmd + '\r');
-      terminal.lastActivity = new Date();
+            resolved = true;
+            clearTimeout(timeout);
+            this.busyChannels.delete(channelId);
+            reject(new Error('Claude command exited before producing JSON output'));
+          }
+        }
+      );
     });
   }
 }
