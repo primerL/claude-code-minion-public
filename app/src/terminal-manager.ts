@@ -361,7 +361,16 @@ export class TerminalManager {
     // Get model from environment variable, default to sonnet-4.5
     const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-5-20250929';
 
-    const args = ['-p', input.replace(/\r/g, ''), '--model', model, '--output-format', 'json'];
+    const args = [
+      '-p',
+      input.replace(/\r/g, ''),
+      '--model',
+      model,
+      '--output-format',
+      'json',
+      '--allowedTools',
+      'mcp__slack-messenger__send_regular_message,mcp__slack-messenger__send_mention_message,mcp__slack-messenger__upload_file',
+    ];
     if (existingSessionId) {
       args.push('--resume', existingSessionId);
       const tokenLog = oauthToken ? ` (token: ${oauthToken.substring(0, 15)}...)` : '';
@@ -552,7 +561,16 @@ export class TerminalManager {
 
     const model = process.env.CLAUDE_MODEL || 'claude-sonnet-4-5-20250929';
     const existingSessionId = this.sessionIds.get(channelId);
-    const args = ['-p', input.replace(/\r/g, ''), '--model', model, '--output-format', 'json'];
+    const args = [
+      '-p',
+      input.replace(/\r/g, ''),
+      '--model',
+      model,
+      '--output-format',
+      'json',
+      '--allowedTools',
+      'mcp__slack-messenger__send_regular_message,mcp__slack-messenger__send_mention_message,mcp__slack-messenger__upload_file',
+    ];
     if (existingSessionId) {
       args.push('--resume', existingSessionId);
     }
